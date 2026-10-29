@@ -1,11 +1,14 @@
 import pandas as pd
 import numpy as np
 import re
+import sys
+print(sys.executable)
 
 
 delta = 0.3                 # flegg size parameter 
 min_jobs = 5                # to prevent supplie chain to be zeroed out by Nomis rounding data to 0
 demand = {"C28": 10, "C27": 5, "J62": 5, "C27": 20, "M72": 10}   # chosen sectors and amounts invested in £m
+# is C27 meant to be put twice?
 sort_by = "Output - Swindon (£m)"    # column to sort the results by
 
 
@@ -19,7 +22,7 @@ def read_employment(filepath, name):
     df = df.dropna(subset=["sic"])
     return df.groupby("sic")[name].sum()
 
-swindon = read_employment("swindonemplyment.csv", "Swindon")
+swindon = read_employment("swindonemployement.csv", "Swindon")
 uk = read_employment("nationaldata.csv", "UK")
 swindon[(swindon == 0) & (uk > 0)] = min_jobs    # only where the uk actually has jobs
 
