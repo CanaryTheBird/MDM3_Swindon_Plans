@@ -1,0 +1,6 @@
+Quick notes on the Solow Swan stuff
+There is a new ODE file for the Solow Swan Model
+It contains similar basics from the mapping form, but with the labour force and total factor productivity now variable
+The actual ODE solver needs some work - the plots aren't very good, they don't show the steady state very well and the time values for the k in IVP are a bit off
+The mapping file is also uploaded
+If anyone wants to further test the files to improve them by all means
