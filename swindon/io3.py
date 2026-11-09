@@ -22,8 +22,8 @@ def read_employment(filepath, name):
     df = df.dropna(subset=["sic"])
     return df.groupby("sic")[name].sum()
 
-swindon = read_employment("swindonemployement.csv", "Swindon")
-uk = read_employment("nationaldata.csv", "UK")
+swindon = read_employment(r"swindon\swindonemployement.csv", "Swindon")
+uk = read_employment(r"swindon\nationaldata.csv", "UK")
 swindon[(swindon == 0) & (uk > 0)] = min_jobs    # only where the uk actually has jobs
 
 total_swindon = swindon.sum()
@@ -32,7 +32,7 @@ print("Swindon jobs:", total_swindon, " UK jobs:", total_uk)
 
 
 #national coefficient matrix
-raw = pd.read_csv("coefficients.csv", header=None, names=range(120))
+raw = pd.read_csv(r"swindon\coefficients.csv", header=None, names=range(120))
 labels = raw[0].astype(str).str.strip().tolist()
 
 start = labels.index("A01")
@@ -105,5 +105,5 @@ kept = (x_swindon.sum() - f.sum()) / (x_national.sum() - f.sum())
 print("Share of the supply chain kept in Swindon: %.0f%%" % (kept * 100))
 
 print(results.drop(columns="Industry").round(2).to_string(index=False))
-results.to_excel("swindon_results.xlsx", index=False)
+results.to_excel(r"swindon\swindon_results.xlsx", index=False)
 print("\nsaved swindon_results.xlsx")
