@@ -34,7 +34,7 @@ cge.model_solve("ipopt")
     #raise RuntimeError("Scenario solve did not terminate optimally")
 
 # Z is production output in SplModelDef.
-base_output = value(cge.base.Z["BRD"])
-scenario_output = value(cge.sim.Z["BRD"])
-print(f"Bread output: {base_output:.2f} → {scenario_output:.2f}")
+base_output = value(cge.base.Z[NAME])
+scenario_output = value(cge.sim.Z[NAME])
+print(f"output: {base_output:.2f} → {scenario_output:.2f}")
 print(f"Change: {100 * (scenario_output / base_output - 1):.2f}%")
