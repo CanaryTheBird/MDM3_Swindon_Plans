@@ -1,5 +1,6 @@
 from math import isclose
 import pyomo.environ as pyo
+#dont install pycge, pip install git+https://github.com/juanfung/pycge.git
 from pycge.examples.splcge_model_def import SplModelDef
 from pycge.pycge import PyCGE
 
