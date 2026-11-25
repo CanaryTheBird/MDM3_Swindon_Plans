@@ -1,4 +1,6 @@
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 import pyomo.environ as pyo
 from pycge.examples.stdcge_model_def import StdModelDef
 import matplotlib.pyplot as plt
@@ -326,75 +328,144 @@ def plot_money(investment_captial_results):
 
 ##################################################################################################################################################
 
-#these functions define the CGE model
+def run_one_allocation(amount, mode, epsilon_L, base_sectors):
+    """
+    Run one investment allocation in a separate process.
+
+    Each worker builds its own Pyomo models and IPOPT solver. This avoids
+    trying to share Pyomo model objects between processes.
+    """
+    scenario, netted, goods, baseline_model = scenario_model(
+        amount, mode, epsilon_L
+    )
+
+    solver = pyo.SolverFactory("ipopt")
+    shocked_annual, shocked_sectors = project_cge(
+        scenario, goods, solver
+    )
+
+    jobs_change_by_sector = (
+        shocked_sectors["Estimated jobs"]
+        - base_sectors["Estimated jobs"]
+    ).unstack("Sector").sort_index()
+
+    net_jobs_by_year = jobs_change_by_sector.sum(
+        axis=1, skipna=False
+    )
+
+    capital_income_change = (
+        shocked_sectors["Capital income"]
+        - base_sectors["Capital income"]
+    )
+
+    job_result = {
+        "Allocation": amount.copy(),
+        "Net jobs in 2031": net_jobs_by_year.loc[2031],
+    }
+
+    capital_result = {
+        "Allocation": amount.copy(),
+        "Capital income change in 2031":
+            capital_income_change.xs(2031, level="Year").sum(skipna=False),
+    }
+
+    return job_result, capital_result
 
 
-mode = "reallocate"  # "reallocate" or "add_external"
+def main():
+    mode = "reallocate"  # "reallocate" or "add_external"
 
-# For reallocation, positive amounts receive investment budget and negative
-# amounts give it up. The changes must sum to zero. REAL is an example donor.
-# For add_external, use only nonnegative amounts
+    # Assumed elasticity of labour supply with respect to the real wage.
+    epsilon_L = 0.6
 
-# Assumed elasticity of labour supply with respect to the real wage.
-# The supplied value and its cited source have not been independently verified.
-epsilon_L = 0.6
-sam, goods, netted, data = sam_to_std()
+    sam, goods, netted, data = sam_to_std()
+    goods = list(goods)
 
-#This is the total budget and where its coming from
-budget = 15.0
-#in this case its coming from REAL
-donor = "REAL"
-recipients = [sector for sector in goods if sector != donor]
+    # Total investment budget and its source.
+    budget = 15.0
+    donor = "REAL"
+    recipients = [sector for sector in goods if sector != donor]
 
-# Test giving the entire budget to each sector in turn.
-list_of_ammounts = [
-    {sector: budget, donor: -budget}
-    for sector in recipients
-]
+    # Test giving the entire budget to each sector in turn.
+    list_of_amounts = [
+        {sector: budget, donor: -budget}
+        for sector in recipients
+    ]
 
-# Test an equal split across all eligible sectors.
-list_of_ammounts.append({
-    **{sector: budget / len(recipients) for sector in recipients},
-    donor: -budget,
-})
+    # Test an equal split across all eligible sectors.
+    list_of_amounts.append({
+        **{sector: budget / len(recipients) for sector in recipients},
+        donor: -budget,
+    })
 
-# Test a range of mixed allocations, including concentrated splits.
-rng = np.random.default_rng(42)
+    # Test 100 random mixed allocations.
+    rng = np.random.default_rng(42)
+    for weights in rng.dirichlet(
+        np.full(len(recipients), 0.2), size=100
+    ):
+        allocation = dict(zip(recipients, budget * weights))
+        allocation[donor] = -budget
+        list_of_amounts.append(allocation)
 
-#creates some noise
-for weights in rng.dirichlet(np.full(len(recipients), 0.2), size=100):
-    allocation = dict(zip(recipients, budget * weights))
-    allocation[donor] = -budget
-    list_of_ammounts.append(allocation)
+    print(f"Testing {len(list_of_amounts)} investment allocations.")
+
+    # Solve the baseline once, before starting the parallel scenarios.
+    base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
+    baseline_solver = pyo.SolverFactory("ipopt")
+    base_annual, base_sectors = project_cge(
+        base, goods, baseline_solver
+    )
+
+    # Choose a sensible number of worker processes.
+    # Start with 4; increase only if your RAM and CPU can handle it.
+    max_workers = min(4, os.cpu_count() or 1, len(list_of_amounts))
+    print(f"Running scenarios using {max_workers} worker processes.")
+
+    job_results = []
+    investment_capital_results = []
+
+    # Windows requires multiprocessing code to be protected by
+    # if __name__ == "__main__": (the call at the bottom does this).
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                run_one_allocation,
+                amount,
+                mode,
+                epsilon_L,
+                base_sectors,
+            ): index
+            for index, amount in enumerate(list_of_amounts, start=1)
+        }
+
+        for future in as_completed(futures):
+            scenario_number = futures[future]
+            try:
+                job_result, capital_result = future.result()
+                job_results.append(job_result)
+                investment_capital_results.append(capital_result)
+                print(
+                    f"Finished scenario {scenario_number}/"
+                    f"{len(list_of_amounts)}"
+                )
+            except Exception as error:
+                print(
+                    f"Scenario {scenario_number} failed: {error}"
+                )
+                raise
+
+    # Keep results in their original scenario order.
+    job_results.sort(
+        key=lambda row: list_of_amounts.index(row["Allocation"])
+    )
+    investment_capital_results.sort(
+        key=lambda row: list_of_amounts.index(row["Allocation"])
+    )
+
+    print("\nAll scenarios completed.")
+    plot_jobs(job_results)
+    plot_money(investment_capital_results)
 
 
-investment_captial_results = []
-job_results = []
-# Run the base and scenario models, then print the results.
-base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
-#runs the base model over time frame
-base_annul,base_sectors = project_cge(base,goods,pyo.SolverFactory("ipopt"))
-
-for amount in list_of_ammounts:
-    #runs the simulation
-    scenario, netted, goods, base = scenario_model(amount, mode, epsilon_L)
-
-    #find the dynamic of cge of the simulated year this is called the shocked year
-    shocked_annul,shocked_sectors = project_cge(scenario,goods,pyo.SolverFactory("ipopt"))
-
-    #number of jobs changed by sector
-    jobs_change_by_sector = (shocked_sectors["Estimated jobs"] - base_sectors["Estimated jobs"]).unstack("Sector").sort_index()
-
-    net_jobs_change = jobs_change_by_sector.sum(axis=1)
-
-    net_jobs_by_year = jobs_change_by_sector.sum(axis=1, skipna=False)
-
-    #shows the difference in number of jobs from the base model 
-    job_results.append({"Allocation": amount.copy(),"Net jobs in 2031": net_jobs_by_year.loc[2031],})
-
-    #capital change
-    capital_income_change = (shocked_sectors["Capital income"] - base_sectors["Capital income"])
-
-    investment_captial_results.append({"Allocation": amount.copy(),"Capital income change in 2031": (capital_income_change.xs(2031, level="Year").sum(skipna=False)),})
-
-
+if __name__ == "__main__":
+    main()

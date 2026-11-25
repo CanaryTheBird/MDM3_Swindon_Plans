@@ -451,8 +451,8 @@ sam, goods, netted, data = sam_to_std()
 #This is the total budget and where its coming from
 budget = 15.0
 #in this case its coming from REAL
-donor = "REAL"
-recipients = [sector for sector in goods if sector != donor]
+recipients = []
+donor = []
 
 # Test giving the entire budget to each sector in turn.
 list_of_ammounts = [
