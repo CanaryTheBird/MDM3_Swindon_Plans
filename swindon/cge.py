@@ -1,38 +1,133 @@
-from math import isclose
-import pyomo.environ as pyo
-#dont install pycge, pip install git+https://github.com/juanfung/pycge.git
-from pycge.examples.splcge_model_def import SplModelDef
-from pycge.pycge import PyCGE
+if __name__ == "__main__":
 
-# Build the benchmark and fix the capital price as the numeraire.
-cge = PyCGE(SplModelDef())
-file_name = r"swindon\sam_input"
-cge.model_data(file_name)
-cge.model_instance("pf", "CAP")
+    mode = "reallocate"
+    epsilon_L = 0.6
 
-base = cge.base
-print(base.i)
-sector = next(iter(base.i))
-base.eqpx[sector].deactivate()
+    allocation = {
+        "MATL": 0.0,
+        "ENG": 0.0,
+        "C27": 0.0,
+        "TRAN": 0.0,
+        "INFO": 0.0,
+        "FIN": 15.0,
+        "M72": 0.0
+    }
 
-# Solve the benchmark.
-cge.model_calibrate("ipopt")
+    budget = sum(allocation.values())
 
-# Increase the labour endowment by 10% and solve the scenario.
-cge.model_sim()
-labour = pyo.value(base.FF["LAB"])
-cge.model_modify_sim("FF", "LAB", 1.10 * labour)
-cge.model_solve("ipopt")
+    sam, _, _, _ = sam_to_std()
 
-# Verify that the omitted goods market clears in both solutions.
-for label, model in [("Benchmark", base), ("Scenario", cge.sim)]:
-    demand = pyo.value(model.X[sector])
-    supply = pyo.value(model.Z[sector])
-    print(f"{label} {sector} market residual: {demand - supply:.3g}")
+    # Create baseline model
+    base, _, _, goods, netted, _ = base_model(
+        mode, {}, epsilon_L
+    )
 
+    # Identify donor sectors
+    donors = [i for i in goods if i not in allocation]
 
-base_output = pyo.value(base.Z[sector])
-scenario_output = pyo.value(cge.sim.Z[sector])
-print(f"{sector} output: {base_output:.2f} → {scenario_output:.2f}")
-if base_output != 0:
-    print(f"Change: {100 * (scenario_output / base_output - 1):.2f}%")
+    # Withdraw investment proportionally
+    donor_weights = sam.loc[donors, "INV"].clip(lower=0)
+    donor_weights /= donor_weights.sum()
+
+    amount = {
+        i: -budget * donor_weights[i]
+        for i in donors
+    }
+
+    amount.update(allocation)
+
+    # Convert investment amounts into changes in investment shares
+    scenario, _, _, _ = scenario_model(
+        amount,
+        mode,
+        epsilon_L,
+        cached=(base, sam, goods, netted)
+    )
+
+    # Baseline projection
+    print("Running baseline...")
+
+    base_annual, base_sectors = project_cge(
+        base,
+        goods,
+        make_solver()
+    )
+
+    # One-off investment
+    print("Running one-off investment...")
+
+    one_annual, one_sectors = project_cge(
+        base,
+        goods,
+        make_solver(),
+        scenario=scenario,
+        shock_year=2027,
+        recurring=False
+    )
+
+    # Recurring investment
+    print("Running recurring investment...")
+
+    rec_annual, rec_sectors = project_cge(
+        base,
+        goods,
+        make_solver(),
+        scenario=scenario,
+        shock_year=2027,
+        recurring=True
+    )
+
+    # Calculate employment changes relative to baseline
+    one_jobs = (
+        one_sectors["Estimated jobs"]
+        - base_sectors["Estimated jobs"]
+    ).groupby(level="Year").sum()
+
+    rec_jobs = (
+        rec_sectors["Estimated jobs"]
+        - base_sectors["Estimated jobs"]
+    ).groupby(level="Year").sum()
+
+    # Combine results
+    results = pd.DataFrame({
+        "Baseline jobs": base_sectors[
+            "Estimated jobs"
+        ].groupby(level="Year").sum(),
+
+        "One-off job change": one_jobs,
+        "Recurring job change": rec_jobs
+    })
+
+    print(results.round(3))
+
+    results.to_csv("FIN_employment_projection.csv")
+
+    # Plot employment changes
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(
+        one_jobs.index,
+        one_jobs.values,
+        marker="o",
+        label="One-off investment"
+    )
+
+    plt.plot(
+        rec_jobs.index,
+        rec_jobs.values,
+        marker="s",
+        label="Recurring investment"
+    )
+
+    plt.axhline(0, color="grey", linestyle="--")
+
+    plt.xlabel("Year")
+    plt.ylabel("Net additional jobs relative to baseline")
+    plt.title("£15m investment reallocation into Finance and Insurance")
+
+    plt.xticks(range(2026, 2032))
+    plt.ticklabel_format(axis="y", style="plain", useOffset=False)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()

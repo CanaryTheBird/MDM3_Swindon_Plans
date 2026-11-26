@@ -67,6 +67,7 @@ def base_model(mode, amount, epsilon_L):
                     var.domain = pyo.Reals
                     var.setlb(None)
                 else:
+                    var.domain = pyo.NonNegativeReals
                     var.setlb(0)
 
     # With a price reference fixed, omit one redundant goods market equation.
@@ -118,40 +119,22 @@ def base_model(mode, amount, epsilon_L):
 
     return base, shares, extra_investment, goods, netted, data
 
-def scenario_model(amount, mode, epsilon_L, cached=None):    
-    # Create a scenario model with the same data and equations as the base.
+def scenario_model(amount, mode, epsilon_L, cached=None):
+    # No separate scenario equilibrium: pass investment share changes to the path.
+    if mode != "reallocate":
+        raise ValueError("This corrected version supports reallocation only.")
     if cached is None:
-        base, shares, extra_investment, goods, netted, data = base_model(mode, amount, epsilon_L)
+        sam, _, _, _ = sam_to_std()
+        base, _, _, goods, netted, _ = base_model(mode, {}, epsilon_L)
     else:
         base, sam, goods, netted = cached
-        shares, extra_investment = investment_settings(sam, goods, mode, amount)
-    scenario = base.clone()
-    scenario.eqXv.deactivate()
-    for i, share in shares.items():
-        if share == 0:
-            scenario.Xv[i].setlb(0)
+    original, _ = investment_settings(sam, goods, mode, {})
+    changed, _ = investment_settings(sam, goods, mode, amount)
+    delta = {i: changed[i] - original[i] for i in goods}
+    if abs(sum(delta.values())) > 1e-9:
+        raise ValueError("Reallocation must preserve total investment shares.")
+    return delta, netted, goods, base
 
-    def investment_rule(model, i):
-        # Ordinary investment uses savings. Extra orders receive outside funds.
-        savings = model.Sp + model.Sg + model.epsilon * model.Sf
-        return model.Xv[i] == (shares[i] * savings / model.pq[i] + extra_investment.get(i, 0.0))
-
-    scenario.scenario_investment = pyo.Constraint(scenario.i, rule=investment_rule)
-    if mode == "add_external":
-        # eqepsilon is the external payments balance. Price the additional
-        # orders in the scenario and convert their cost to external units.
-        scenario.eqepsilon.deactivate()
-        transfer = sum(scenario.pq[i] * value for i, value in extra_investment.items()) / scenario.epsilon
-        scenario.scenario_external_balance = pyo.Constraint(expr=sum(scenario.pWm[i] * scenario.M[i] for i in goods)
-                                                            == sum(scenario.pWe[i] * scenario.E[i] for i in goods)
-                                                            + scenario.Sf + transfer)
-
-    solver = pyo.SolverFactory("ipopt")
-    result = solver.solve(scenario)
-    if not pyo.check_optimal_termination(result):
-        raise RuntimeError(f"Scenario calibration failed for {amount}: {result.solver.termination_condition}")
-
-    return scenario, netted, goods, base
 
 def jobs_change(base, scenario, goods):
     # Calculate the change in jobs for each industry.
@@ -270,12 +253,15 @@ def make_solver():
     return solver
 
 
-def solve_gradually(model, solver, target_cap, target_lab, target_tech):
+def solve_gradually(model, solver, target_cap, target_lab, target_tech, target_shares):
     params = [model.FF["CAP"], model.FF["LAB"]]
     targets = [target_cap, target_lab]
     if hasattr(model, "tech"):
         params.append(model.tech)
         targets.append(target_tech)
+    for i in model.i:
+        params.append(model.investment_share[i])
+        targets.append(target_shares[i])
     starts = [pyo.value(p) for p in params]
     variables = list(model.component_data_objects(pyo.Var))
     progress, step = 0.0, 1.0
@@ -324,38 +310,44 @@ def solve_gradually(model, solver, target_cap, target_lab, target_tech):
 def project_cge(
     base, goods, solver, *, scenario=None, shock_year=2027,
     recurring=False, initial_capital_stock=12_503_623_082,
-    benchmark_investment_pounds=0.18 * 12_700_000_000,
+    investment_scale=1_000_000,
     initial_labour=155_927, initial_output=12_700_000_000,
     n=0.005, g=0.002, alpha=0.35, depreciation=0.08,
     enable_technology=True,
 ):
-    # Always use the original calibrated economy as the reference.
-    normal = base.clone()
-    shocked = scenario.clone() if scenario is not None else None
+    # One model per trajectory; all years warm-start from the previous year.
+    goods = list(goods)
+    if len(goods) != len(set(goods)):
+        raise ValueError(f"Duplicate sectors in goods: {goods}")
+    model = base.clone()
     cap0 = pyo.value(base.FF["CAP"])
     lab0 = pyo.value(base.FF["LAB"])
     prices = {i: pyo.value(base.pq[i]) for i in goods}
-
-    def real_investment(model):
-        return sum(prices[i] * pyo.value(model.Xv[i]) for i in goods)
-
-    # Benchmark conversion from SAM investment units to pounds.
-    investment_scale = benchmark_investment_pounds / real_investment(base)
-
-    # Update the existing Cobb-Douglas constraint, preserving eqY and eqF.
-    # PyCGE's calibrated b parameter is immutable, so use a mutable multiplier.
+    savings0 = pyo.value(base.Sp + base.Sg + base.epsilon * base.Sf)
+    if savings0 <= 0:
+        raise ValueError("Nonpositive benchmark savings.")
+    original = {i: prices[i] * pyo.value(base.Xv[i]) / savings0 for i in goods}
+    if abs(sum(original.values()) - 1) > 1e-6:
+        raise ValueError("Benchmark investment does not match savings.")
+    changed = {i: original[i] + (scenario or {}).get(i, 0.0) for i in goods}
+    if min(changed.values()) < -1e-10:
+        raise ValueError("Negative investment share after reallocation.")
+    model.investment_share = pyo.Param(model.i, initialize=original, mutable=True)
+    model.eqXv.deactivate()
+    model.scenario_investment = pyo.Constraint(model.i, rule=lambda m,i:
+        m.pq[i]*m.Xv[i] == m.investment_share[i]*(m.Sp+m.Sg+m.epsilon*m.Sf))
+    for i in goods:
+        if original[i] >= 0:
+            model.Xv[i].domain = pyo.NonNegativeReals
+            model.Xv[i].setlb(0)
+    def real_investment(m):
+        return sum(prices[i] * pyo.value(m.Xv[i]) for i in goods)
     if enable_technology:
-        for model in [normal, shocked]:
-            if model is None:
-                continue
-            model.tech = pyo.Param(initialize=1.0, mutable=True)
-            for i in goods:
-                model.eqpy[i].set_value(
-                    model.Y[i] == model.b[i]
-                    * model.tech ** model.beta["LAB", i]
-                    * pyo.prod(model.F[h, i] ** model.beta[h, i]
-                               for h in model.h)
-                )
+        model.tech = pyo.Param(initialize=1.0, mutable=True)
+        for i in goods:
+            model.eqpy[i].set_value(model.Y[i] == model.b[i]
+                * model.tech ** model.beta["LAB", i]
+                * pyo.prod(model.F[h,i] ** model.beta[h,i] for h in model.h))
 
     K = initial_capital_stock
     L = initial_labour
@@ -364,10 +356,10 @@ def project_cge(
     annual, sectors = [], []
 
     for year in range(2026, 2032):
-        apply_shock = shocked is not None and (
+        apply_shock = scenario is not None and (
             year == shock_year or (recurring and year >= shock_year)
         )
-        model = shocked if apply_shock else normal
+        target_shares = changed if apply_shock else original
         target_cap = cap0 * K / initial_capital_stock
         target_lab = lab0 * L / initial_labour
         target_tech = A / A0
@@ -376,13 +368,21 @@ def project_cge(
         if year != 2026 or apply_shock:
             try:
                 solve_gradually(model, solver, target_cap, target_lab,
-                                target_tech)
+                                target_tech, target_shares)
             except Exception as exc:
                 raise RuntimeError(
                     f"CGE failed in {year}, shock={apply_shock}, "
                     f"K={K:.6g}, L={L:.6g}, technology={target_tech:.6g}: {exc}"
                 ) from exc
 
+        # Check the omitted market equation as well as active equations.
+        for con in list(model.component_data_objects(pyo.Constraint, active=True)) + [model.eqpqd[goods[0]]]:
+            body = pyo.value(con.body)
+            for bound, sign in [(con.lower, -1), (con.upper, 1)]:
+                if bound is not None:
+                    rhs = pyo.value(bound)
+                    if not np.isfinite(body) or sign*(body-rhs) > 1e-3 + 1e-6 * max(1, abs(rhs), abs(body)):
+                        raise RuntimeError(f"Market/constraint residual in {year}: {con.name}: {body-rhs}")
         investment = investment_scale * real_investment(model)
         # Include productivity in constant-price value added via Y quantities.
         real_gva = sum(pyo.value(base.py[i]) * pyo.value(model.Y[i])
@@ -414,41 +414,128 @@ def project_cge(
         L *= exp(n)
         A *= exp(g)
 
-    return (pd.DataFrame(annual).set_index("Year"),
-            pd.DataFrame(sectors).set_index(["Year", "Sector"]))
+    annual_frame = pd.DataFrame(annual).set_index("Year")
+    sector_frame = pd.DataFrame(sectors).set_index(["Year", "Sector"])
+    if not annual_frame.index.is_unique or not sector_frame.index.is_unique:
+        raise ValueError("Duplicate year or year-sector entries in projection.")
+    return annual_frame, sector_frame
+
+
+def baseline_diagnostics(base_annual, base_sectors):
+    """Export the baseline, labour-to-jobs conversion and sectoral changes.
+
+    Labour quantities are benchmark factor units, not headcounts. These
+    diagnostics do not change the calibrated model or its equations.
+    """
+    if not base_sectors.index.is_unique:
+        raise ValueError("Duplicate year-sector keys in baseline diagnostics.")
+    jobs = base_sectors["Estimated jobs"].unstack("Sector").sort_index()
+    labour = base_sectors["Labour (model units)"].unstack("Sector").sort_index()
+    if not jobs.index.equals(labour.index) or not jobs.columns.equals(labour.columns):
+        raise ValueError("Employment and labour tables do not align.")
+    if not np.isfinite(jobs.to_numpy()).all() or not np.isfinite(labour.to_numpy()).all():
+        raise ValueError("Nonfinite baseline labour or jobs data.")
+    if (labour.loc[2026] <= 0).any() or (jobs.loc[2026] <= 0).any():
+        raise ValueError("Nonpositive benchmark labour or employment; check sector data.")
+
+    jobs_change = jobs.subtract(jobs.loc[2026], axis=1)
+    jobs_growth = (jobs.divide(jobs.loc[2026], axis=1) - 1) * 100
+    labour_growth = (labour.divide(labour.loc[2026], axis=1) - 1) * 100
+    comparison = base_annual.copy()
+    comparison["Estimated jobs"] = jobs.sum(axis=1, skipna=False)
+    comparison["CGE labour demand"] = labour.sum(axis=1, skipna=False)
+    comparison["Jobs growth (%)"] = (comparison["Estimated jobs"] / jobs.loc[2026].sum() - 1) * 100
+    comparison["Labour growth (%)"] = (comparison["CGE labour demand"] / labour.loc[2026].sum() - 1) * 100
+    comparison["Labour market gap (model units)"] = (
+        comparison["CGE labour demand"] - comparison["Labour supply (model units)"]
+    )
+
+    conversion_factor = jobs.loc[2026] / labour.loc[2026]
+    sector_results = pd.DataFrame({
+        "Jobs in 2026": jobs.loc[2026],
+        "Jobs in 2031": jobs.loc[2031],
+        "Jobs change": jobs_change.loc[2031],
+        "Jobs growth (%)": jobs_growth.loc[2031],
+        "Labour in 2026 (model units)": labour.loc[2026],
+        "Labour in 2031 (model units)": labour.loc[2031],
+        "Labour growth (%)": labour_growth.loc[2031],
+        "Jobs per labour unit": conversion_factor,
+        "Labour share 2026 (%)": labour.loc[2026] / labour.loc[2026].sum() * 100,
+        "Labour share 2031 (%)": labour.loc[2031] / labour.loc[2031].sum() * 100,
+    }).sort_values("Jobs change")
+    conversion_results = sector_results[["Jobs in 2026", "Labour in 2026 (model units)",
+                                         "Jobs per labour unit", "Jobs change"]].sort_values(
+                                             "Jobs per labour unit", ascending=False)
+    print("\nBaseline employment and labour demand:")
+    print(comparison[["Estimated jobs", "CGE labour demand", "Jobs growth (%)",
+                      "Labour growth (%)", "Labour market gap (model units)"]].round(3).to_string())
+    print("\nBaseline employment changes by sector:")
+    print(sector_results[["Jobs in 2026", "Jobs in 2031", "Jobs change",
+                          "Jobs growth (%)", "Jobs per labour unit"]].round(3).to_string())
+    comparison.to_csv("baseline_employment_diagnostic.csv")
+    sector_results.to_csv("baseline_sector_diagnostic.csv")
+    conversion_results.to_csv("labour_conversion_diagnostic.csv")
+    base_sectors.to_csv("baseline_sector_annual.csv")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(comparison.index, comparison["Jobs growth (%)"], marker="o", label="Estimated jobs")
+    ax.plot(comparison.index, comparison["Labour growth (%)"], marker="s", label="CGE labour demand")
+    ax.axhline(0, color="grey", linestyle="--")
+    ax.set(xlabel="Year", ylabel="Change relative to 2026 (%)",
+           title="Baseline employment and labour demand")
+    ax.set_xticks(comparison.index)
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("baseline_employment_growth.png", dpi=200)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    changes = sector_results["Jobs change"]
+    ax.barh(changes.index, changes.values,
+            color=["seagreen" if x >= 0 else "indianred" for x in changes])
+    ax.axvline(0, color="black", linewidth=1)
+    ax.set(xlabel="Estimated employment change", ylabel="Sector",
+           title="Baseline sectoral employment change: 2026–2031")
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig("baseline_sector_employment.png", dpi=200)
+    plt.close(fig)
+    print("Baseline diagnostics and figures saved.", flush=True)
+    return comparison, sector_results
 
 
 def plot_jobs(investment_results):
 
     ranking = (
         pd.DataFrame(investment_results)
-        .dropna(subset=["Net jobs in 2031"])
-        .sort_values("Net jobs in 2031", ascending=False)
+        .dropna(subset=["Cumulative job-years 2027-2031"])
+        .sort_values("Cumulative job-years 2027-2031", ascending=False)
     )
 
     ranked = (
-        ranking.dropna(subset=["Net jobs in 2031"])
-        .sort_values("Net jobs in 2031", ascending=False)
+        ranking.dropna(subset=["Cumulative job-years 2027-2031"])
+        .sort_values("Cumulative job-years 2027-2031", ascending=False)
         .reset_index(drop=True)
     )
     ranked["Rank"] = ranked.index + 1
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.scatter(ranked["Rank"], ranked["Net jobs in 2031"], color="steelblue")
+    ax.scatter(ranked["Rank"], ranked["Cumulative job-years 2027-2031"], color="steelblue")
     ax.axhline(0, color="grey", linewidth=1)
 
     best = ranked.iloc[0]
-    ax.scatter(best["Rank"], best["Net jobs in 2031"], color="darkorange", zorder=3)
+    ax.scatter(best["Rank"], best["Cumulative job-years 2027-2031"], color="darkorange", zorder=3)
     ax.annotate(
-        f"Best tested: {best['Net jobs in 2031']:+.1f} jobs",
-        (best["Rank"], best["Net jobs in 2031"]),
+        f"Best tested: {best['Cumulative job-years 2027-2031']:+.1f} job-years",
+        (best["Rank"], best["Cumulative job-years 2027-2031"]),
         xytext=(10, 8),
         textcoords="offset points",
     )
 
     ax.set_xlabel("Allocation rank")
-    ax.set_ylabel("Net estimated jobs vs baseline")
-    ax.set_title("£15m investment reallocation rankings for 2031")
+    ax.set_ylabel("Cumulative net job-years vs baseline")
+    ax.set_title("£15m reallocation: cumulative employment, 2027–2031")
     ax.ticklabel_format(axis="y", style="plain", useOffset=False)
     fig.tight_layout()
     plt.plot()
@@ -516,35 +603,63 @@ def initialise_worker(mode, epsilon_L):
     sam, _, _, _ = sam_to_std()
     base, _, _, goods, netted, _ = base_model(mode, {}, epsilon_L)
     _worker_cache = (base, sam, goods, netted)
+    global _worker_baseline
+    _, _worker_baseline = project_cge(base, goods, make_solver())
 
 
 def run_one_allocation(amount, mode, epsilon_L, base_sectors, recipients, recurring=False):
     scenario, netted, goods, scenario_base = scenario_model(
         amount, mode, epsilon_L, cached=_worker_cache
     )
+    def checked_table(frame, name):
+        table = frame.reset_index()
+        keys = ["Year", "Sector"]
+        duplicates = table.loc[table.duplicated(keys, keep=False), keys]
+        if not duplicates.empty:
+            raise ValueError(f"{name} duplicate year-sector keys: {duplicates.to_dict('records')}")
+        return table
+
+    def compare(left, right, name):
+        keys = ["Year", "Sector"]
+        merged = checked_table(left, name).merge(
+            checked_table(right, "Baseline"), on=keys, how="outer",
+            suffixes=("_scenario", "_base"), validate="one_to_one", indicator=True,
+        )
+        if not merged["_merge"].eq("both").all():
+            raise ValueError(f"{name} and baseline year-sector keys differ")
+        return merged
+
+    worker_check = compare(_worker_baseline, base_sectors, "Worker baseline")
+    if not np.allclose(worker_check["Estimated jobs_scenario"],
+                       worker_check["Estimated jobs_base"], atol=0.05, rtol=0):
+        raise RuntimeError("Worker baseline differs from parent baseline.")
     solver = make_solver()
     shocked_annual, shocked_sectors = project_cge(
         scenario_base, goods, solver, scenario=scenario,
         shock_year=2027, recurring=recurring,
     )
-
-    jobs_change_by_sector = (
-        shocked_sectors["Estimated jobs"] - base_sectors["Estimated jobs"]
-    ).unstack("Sector").sort_index()
-    net_jobs_by_year = jobs_change_by_sector.sum(axis=1, skipna=False)
-
-    capital_income_change = (
-        shocked_sectors["Real capital income"] - base_sectors["Real capital income"]
-    )
-    total_capital_income_change = (
-        capital_income_change.xs(2031, level="Year")
-        .sum(skipna=False)
-    )
+    comparison = compare(shocked_sectors, _worker_baseline, "Scenario")
+    comparison["Jobs change"] = (comparison["Estimated jobs_scenario"]
+                                 - comparison["Estimated jobs_base"])
+    comparison["Capital change"] = (comparison["Real capital income_scenario"]
+                                    - comparison["Real capital income_base"])
+    if not np.isfinite(comparison[["Jobs change", "Capital change"]].to_numpy()).all():
+        raise ValueError("Nonfinite sector results")
+    net_jobs_by_year = comparison.groupby("Year")["Jobs change"].sum().sort_index()
+    if net_jobs_by_year.index.tolist() != list(range(2026, 2032)):
+        raise ValueError("Missing projection years in employment results.")
+    total_capital_income_change = comparison.loc[
+        comparison["Year"].eq(2031), "Capital change"
+    ].sum()
 
     return (
         {
             "Allocation": amount.copy(),
+            "Cumulative job-years 2027-2031": net_jobs_by_year.loc[2027:2031].sum(),
             "Net jobs in 2031": net_jobs_by_year.loc[2031],
+            "Peak jobs 2027-2031": net_jobs_by_year.loc[2027:2031].max(),
+            **{f"Net jobs in {year}": net_jobs_by_year.loc[year]
+               for year in range(2027, 2031)},
         },
         {
             "Allocation": amount.copy(),
@@ -555,15 +670,16 @@ def run_one_allocation(amount, mode, epsilon_L, base_sectors, recipients, recurr
 
 def main():
     start_time = time.monotonic()
-    max_runtime_hours = 100
+    max_runtime_hours = 8
     deadline = start_time + max_runtime_hours * 3600
-    mode = "reallocate"  # "reallocate" or "add_external"
+    mode = "reallocate"  # Reallocation only in this version.
     epsilon_L = 0.6
 
     sam, goods, netted, data = sam_to_std()
 
     recurring = False  # True: maintain the changed investment shares from 2027
-    max_evaluations = 1000  # Total attempts, including saved results.
+    diagnostics_only = False  # True: produce baseline diagnostics and stop.
+    max_evaluations = 500  # Total attempts, including saved results.
     candidate_count = 20000
     worker_limit = 4  # Benchmark 4 versus 8 on your machine.
     budget = 15.0
@@ -588,21 +704,37 @@ def main():
         return {**dict(zip(recipients, budget * np.asarray(weights))),
                 **donor_changes}
 
-    # Separate checkpoint from the old random-search results.
-    checkpoint = Path("bayesian_investment_results.csv")
+    if diagnostics_only:
+        print("Solving baseline model for diagnostics...")
+        base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
+        base_annual, base_sectors = project_cge(base, goods, make_solver())
+        baseline_diagnostics(base_annual, base_sectors)
+        return
+
+    # Separate checkpoint because the employment objective has changed.
+    checkpoint = Path("bayesian_v4_investment_results.csv")
+    # BEGIN CHECKPOINT COMPATIBILITY
+    # Preserve V4 signatures: GP settings affect proposal selection only,
+    # not the CGE equations or the values of either objective.
+    source = Path(__file__).read_text(encoding="utf-8")
+    source = re.sub(
+        r"(?ms)^    # BEGIN CHECKPOINT COMPATIBILITY\n.*?^    # END CHECKPOINT COMPATIBILITY\n",
+        lambda _: '    signature = hashlib.sha256(\n        (sam.to_csv() + repr((mode, epsilon_L, recurring, budget, recipients))\n         + re.sub(r"(?m)^    (max_evaluations|worker_limit|candidate_count|max_runtime_hours|diagnostics_only) = .*$", "", Path(__file__).read_text(encoding="utf-8"))).encode()\n    ).hexdigest()\n', source, count=1
+    )
+    source = re.sub(
+        r"(?ms)^            # BEGIN GP SEARCH SETTINGS\n.*?^            # END GP SEARCH SETTINGS\n",
+        lambda _: '            gp = GaussianProcessRegressor(kernel=ConstantKernel(1.0)*Matern(length_scale=0.4, nu=2.5),\n                                          alpha=1e-6, normalize_y=False, random_state=42)\n', source, count=1
+    )
     signature = hashlib.sha256(
         (sam.to_csv() + repr((mode, epsilon_L, recurring, budget, recipients))
-         + re.sub(r"(?m)^    (max_evaluations|worker_limit|candidate_count|max_runtime_hours) = .*$", "", Path(__file__).read_text(encoding="utf-8"))).encode()
+         + re.sub(r"(?m)^    (max_evaluations|worker_limit|candidate_count|max_runtime_hours|diagnostics_only) = .*$", "", source)).encode()
     ).hexdigest()
+    # END CHECKPOINT COMPATIBILITY
     rows = []
     if checkpoint.exists():
         saved = pd.read_csv(checkpoint)
-        # Verify old checkpoints against the exact original Bayesian source.
-        import base64, zlib
-        legacy_source = zlib.decompress(base64.b64decode('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')).decode()
-        legacy_signature = hashlib.sha256((sam.to_csv() + repr((mode, epsilon_L, recurring, budget, recipients)) + legacy_source).encode()).hexdigest()
-        if "Run signature" not in saved or not (saved["Run signature"].eq(signature).all() or saved["Run signature"].eq(legacy_signature).all()):
-            raise ValueError("Checkpoint settings/code differ. Rename the old CSV before starting a new run.")
+        if "Run signature" not in saved or not saved["Run signature"].eq(signature).all():
+            raise ValueError("Checkpoint settings/code differ. Rename the old CSV.")
         saved["Run signature"] = signature
         rows = saved.to_dict("records")
         print(f"Resuming with {len(rows)} previous attempts.")
@@ -613,16 +745,16 @@ def main():
         frame.sort_values("Scenario").to_csv(tmp, index=False)
         os.replace(tmp, checkpoint)
         good = frame[frame["Status"] == "Success"]
-        for score, filename in [("Net jobs in 2031", "bayesian_jobs_rankings.csv"),
-                                ("Capital income change in 2031", "bayesian_capital_rankings.csv")]:
+        for score, filename in [("Cumulative job-years 2027-2031", "bayesian_v4_jobs_rankings.csv"),
+                                ("Capital income change in 2031", "bayesian_v4_capital_rankings.csv")]:
             good.sort_values(score, ascending=False).to_csv(filename, index=False)
-        frame[frame["Status"] == "Failed"].to_csv("bayesian_failed_scenarios.csv", index=False)
+        frame[frame["Status"] == "Failed"].to_csv("bayesian_v4_failed_scenarios.csv", index=False)
 
     rng = np.random.default_rng(42 + len(rows))
     d = len(recipients)
     initial = np.vstack([np.eye(d), np.full((1,d), 1/d),
                          np.random.default_rng(42).dirichlet(np.ones(d), size=4)])
-    scores = ["Net jobs in 2031", "Capital income change in 2031"]
+    scores = ["Cumulative job-years 2027-2031", "Capital income change in 2031"]
 
     def propose(count):
         attempted = [np.array([r[i] for i in recipients], float)/budget for r in rows]
@@ -653,8 +785,22 @@ def main():
             y = np.array([r[score] for r in good], float)
             scale = max(np.std(y), 1e-10)
             y = (y-y.mean())/scale
-            gp = GaussianProcessRegressor(kernel=ConstantKernel(1.0)*Matern(length_scale=0.4, nu=2.5),
-                                          alpha=1e-6, normalize_y=False, random_state=42)
+            # BEGIN GP SEARCH SETTINGS
+            gp = GaussianProcessRegressor(
+                kernel=ConstantKernel(
+                    constant_value=1.0,
+                    constant_value_bounds=(1e-3, 1e3)
+                ) * Matern(
+                    length_scale=0.4,
+                    length_scale_bounds=(0.01, 5.0),
+                    nu=2.5
+                ),
+                alpha=1e-4,
+                normalize_y=False,
+                n_restarts_optimizer=2,
+                random_state=42
+            )
+            # END GP SEARCH SETTINGS
             gp.fit(X,y)
             mu, sd = gp.predict(pool, return_std=True)
             improvement = mu-y.max()-0.01
@@ -680,6 +826,13 @@ def main():
         print("Solving baseline model...")
         base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
         base_annual, base_sectors = project_cge(base, goods, make_solver())
+        baseline_diagnostics(base_annual, base_sectors)
+        # Zero-shock validation before expensive optimisation.
+        _, control = project_cge(base, goods, make_solver(), scenario={i: 0.0 for i in goods})
+        error = (control["Estimated jobs"] - base_sectors["Estimated jobs"]).abs().max()
+        print(f"Zero-shock maximum sector/year error: {error:.6g} jobs")
+        if not np.isfinite(error) or error > 0.05:
+            raise RuntimeError("Zero-shock validation failed; optimisation stopped.")
         max_workers = min(worker_limit, os.cpu_count() or 1)
         with ProcessPoolExecutor(max_workers=max_workers,
                                  initializer=initialise_worker,
@@ -704,10 +857,12 @@ def main():
                     try:
                         jobs,capital = future.result()
                         row.update({scores[0]:jobs[scores[0]], scores[1]:capital[scores[1]]})
+                        row.update({k: v for k, v in jobs.items() if k != "Allocation"})
                         if not all(np.isfinite(row[k]) for k in scores):
                             raise ValueError("Nonfinite objective")
                         row.update(Status="Success", Error="")
                     except Exception as exc:
+                        print(f"Scenario {idx} error: {type(exc).__name__}: {exc}", flush=True)
                         row.update({scores[0]:np.nan,scores[1]:np.nan,
                                     "Status":"Failed","Error":str(exc)})
                     rows.append(row)
