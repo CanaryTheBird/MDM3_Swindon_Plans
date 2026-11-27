@@ -1,3 +1,13 @@
+"""Swindon recursive CGE with sector-specific installed capital (V6).
+
+Policy amounts are in benchmark £m. The SAM's INV column identifies goods
+purchased for investment, not the industry installing those assets. Without
+an investment-by-destination matrix, assume neutral gross investment is
+allocated by benchmark capital income shares, and apply the same signed
+policy transfer to installed capital as to benchmark commodity expenditure.
+Installed capital is immobile between industries; labour remains mobile.
+This is a new model closure, not a correction to the old numerical results.
+"""
 # Set before importing numerical libraries, including in Windows workers.
 import os
 for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -120,7 +130,7 @@ def base_model(mode, amount, epsilon_L):
     return base, shares, extra_investment, goods, netted, data
 
 def scenario_model(amount, mode, epsilon_L, cached=None):
-    # No separate scenario equilibrium: pass investment share changes to the path.
+    # No separate scenario equilibrium: pass signed £m transfers to the path.
     if mode != "reallocate":
         raise ValueError("This corrected version supports reallocation only.")
     if cached is None:
@@ -128,12 +138,14 @@ def scenario_model(amount, mode, epsilon_L, cached=None):
         base, _, _, goods, netted, _ = base_model(mode, {}, epsilon_L)
     else:
         base, sam, goods, netted = cached
-    original, _ = investment_settings(sam, goods, mode, {})
-    changed, _ = investment_settings(sam, goods, mode, amount)
-    delta = {i: changed[i] - original[i] for i in goods}
-    if abs(sum(delta.values())) > 1e-9:
-        raise ValueError("Reallocation must preserve total investment shares.")
-    return delta, netted, goods, base
+    # Return signed transfers in benchmark £m, not share changes.
+    unknown = set(amount) - set(goods)
+    if unknown:
+        raise ValueError(f"Unknown investment sectors: {unknown}")
+    transfer = {i: float(amount.get(i, 0.0)) for i in goods}
+    if not np.isfinite(list(transfer.values())).all() or abs(sum(transfer.values())) > 1e-8:
+        raise ValueError("Reallocation must be finite and budget-neutral.")
+    return transfer, netted, goods, base
 
 
 def jobs_change(base, scenario, goods):
@@ -254,8 +266,12 @@ def make_solver():
 
 
 def solve_gradually(model, solver, target_cap, target_lab, target_tech, target_shares):
+    # Update all sectoral capital supplies along the same continuation path.
     params = [model.FF["CAP"], model.FF["LAB"]]
-    targets = [target_cap, target_lab]
+    targets = [sum(target_cap.values()), target_lab]
+    for i in model.i:
+        params.append(model.capital_supply[i])
+        targets.append(target_cap[i])
     if hasattr(model, "tech"):
         params.append(model.tech)
         targets.append(target_tech)
@@ -264,7 +280,7 @@ def solve_gradually(model, solver, target_cap, target_lab, target_tech, target_s
         targets.append(target_shares[i])
     starts = [pyo.value(p) for p in params]
     variables = list(model.component_data_objects(pyo.Var))
-    progress, step = 0.0, 1.0
+    progress, step = 0.0, 0.25
     min_step = 1e-4
     original_limit = solver.options.get("max_iter", 100)
     last_error = None
@@ -292,7 +308,7 @@ def solve_gradually(model, solver, target_cap, target_lab, target_tech, target_s
                     last_error = exc
             if success:
                 progress = fraction
-                step = min(1.0, step * 1.5)
+                step = min(0.25, step * 1.5)
             else:
                 for var, val in zip(variables, saved):
                     var.set_value(val, skip_validation=True)
@@ -307,6 +323,27 @@ def solve_gradually(model, solver, target_cap, target_lab, target_tech, target_s
         solver.options["max_iter"] = original_limit
 
 
+def installed_investment(total_real_investment, capital_weights, transfer_pounds):
+    """Allocate a single pool of investment; policy shifts its destination.
+
+    capital_weights and transfer_pounds are arrays in the same sector order.
+    This is an assumed destination mapping, not data identified by the SAM.
+    """
+    weights = np.asarray(capital_weights, dtype=float)
+    transfer = np.asarray(transfer_pounds, dtype=float)
+    if (weights.shape != transfer.shape or not np.isfinite(weights).all()
+            or (weights < 0).any() or not np.isclose(weights.sum(), 1.0)
+            or not np.isfinite(transfer).all() or abs(transfer.sum()) > 0.01
+            or not np.isfinite(total_real_investment) or total_real_investment <= 0):
+        raise ValueError("Invalid installed investment inputs or nonzero net transfer.")
+    result = total_real_investment * weights + transfer
+    if (result < 0).any():
+        raise ValueError("Insufficient installed investment in a donor sector.")
+    if not np.isclose(result.sum(), total_real_investment, rtol=1e-12, atol=0.01):
+        raise RuntimeError("Installed investment does not balance.")
+    return result
+
+
 def project_cge(
     base, goods, solver, *, scenario=None, shock_year=2027,
     recurring=False, initial_capital_stock=12_503_623_082,
@@ -315,12 +352,11 @@ def project_cge(
     n=0.005, g=0.002, alpha=0.35, depreciation=0.08,
     enable_technology=True,
 ):
-    # One model per trajectory; all years warm-start from the previous year.
+    # One model per trajectory; capital stocks are carried forward by industry.
     goods = list(goods)
     if len(goods) != len(set(goods)):
         raise ValueError(f"Duplicate sectors in goods: {goods}")
     model = base.clone()
-    cap0 = pyo.value(base.FF["CAP"])
     lab0 = pyo.value(base.FF["LAB"])
     prices = {i: pyo.value(base.pq[i]) for i in goods}
     savings0 = pyo.value(base.Sp + base.Sg + base.epsilon * base.Sf)
@@ -329,9 +365,20 @@ def project_cge(
     original = {i: prices[i] * pyo.value(base.Xv[i]) / savings0 for i in goods}
     if abs(sum(original.values()) - 1) > 1e-6:
         raise ValueError("Benchmark investment does not match savings.")
-    changed = {i: original[i] + (scenario or {}).get(i, 0.0) for i in goods}
-    if min(changed.values()) < -1e-10:
-        raise ValueError("Negative investment share after reallocation.")
+    # The scenario is a dictionary of signed benchmark £m transfers.
+    scenario = scenario or {}
+    if set(scenario) - set(goods):
+        raise ValueError("Unknown sector in policy transfer.")
+    transfer = np.array([scenario.get(i, 0.0) for i in goods], dtype=float)
+    if not np.isfinite(transfer).all() or abs(transfer.sum()) > 1e-8:
+        raise ValueError("Policy transfers must be finite and budget-neutral.")
+    # Maintain the V5 commodity-demand channel: benchmark expenditure shares.
+    benchmark_inv = sum(pyo.value(base.Xv0[i]) for i in goods)
+    if benchmark_inv <= 0:
+        raise ValueError("Nonpositive SAM investment total.")
+    changed = {i: original[i] + transfer[j] / benchmark_inv for j, i in enumerate(goods)}
+    if min(changed.values()) < -1e-10 or abs(sum(changed.values())-1) > 1e-6:
+        raise ValueError("Invalid investment shares after reallocation.")
     model.investment_share = pyo.Param(model.i, initialize=original, mutable=True)
     model.eqXv.deactivate()
     model.scenario_investment = pyo.Constraint(model.i, rule=lambda m,i:
@@ -340,8 +387,42 @@ def project_cge(
         if original[i] >= 0:
             model.Xv[i].domain = pyo.NonNegativeReals
             model.Xv[i].setlb(0)
-    def real_investment(m):
-        return sum(prices[i] * pyo.value(m.Xv[i]) for i in goods)
+
+    # Benchmark capital services are measured at the common benchmark rental
+    # price. Use their shares as a proxy for the shares of physical capital.
+    cap0 = np.array([pyo.value(base.F["CAP", i]) for i in goods])
+    if (cap0 <= 0).any() or not np.isfinite(cap0).all():
+        raise ValueError("All sectoral benchmark capital services must be positive.")
+    weights = cap0 / cap0.sum()
+    K0 = initial_capital_stock * weights
+    K = K0.copy()
+    weight_by_sector = dict(zip(goods, weights))
+    model.capital_supply = pyo.Param(model.i, mutable=True,
+                                    initialize=dict(zip(goods, cap0)))
+    model.capital_rent = pyo.Var(model.i, domain=pyo.PositiveReals,
+                                 initialize=pyo.value(base.pf["CAP"]))
+    # Fix each industry's capital services to its installed stock. Its rental
+    # price is endogenous, so firms still satisfy their factor demand equations.
+    model.eqpf["CAP"].deactivate()
+    for i in goods:
+        model.eqF["CAP", i].set_value(
+            model.F["CAP", i] == model.beta["CAP", i]*model.py[i]*model.Y[i]/model.capital_rent[i])
+    model.sector_capital_market = pyo.Constraint(model.i, rule=lambda m,i:
+        m.F["CAP", i] == m.capital_supply[i])
+    # Retain the previous capital price reference as a fixed-weight rental index.
+    model.capital_numeraire = pyo.Constraint(expr=sum(
+        weight_by_sector[i]*model.capital_rent[i] for i in goods) == model.pf["CAP"])
+    # Household income now uses each industry's own rental rate, not one wage
+    # for all capital. Update all three income-dependent household equations.
+    model.sector_factor_income = pyo.Expression(expr=
+        model.pf["LAB"]*model.LS + sum(model.capital_rent[i]*model.F["CAP", i] for i in goods)
+        + sum(model.pf[h]*model.FF[h] for h in model.h if h not in ("CAP", "LAB")))
+    model.eqTd_LS.set_value(model.Td == model.taud*model.sector_factor_income)
+    model.eqSp_LS.set_value(model.Sp == model.ssp*model.sector_factor_income)
+    for i in goods:
+        model.eqXp_LS[i].set_value(model.Xp[i] == model.alpha[i]*(
+            model.sector_factor_income-model.Sp-model.Td)/model.pq[i])
+
     if enable_technology:
         model.tech = pyo.Param(initialize=1.0, mutable=True)
         for i in goods:
@@ -349,33 +430,27 @@ def project_cge(
                 * model.tech ** model.beta["LAB", i]
                 * pyo.prod(model.F[h,i] ** model.beta[h,i] for h in model.h))
 
-    K = initial_capital_stock
     L = initial_labour
-    A0 = (initial_output / (K**alpha * L**(1-alpha)))**(1/(1-alpha))
+    A0 = (initial_output / (initial_capital_stock**alpha * L**(1-alpha)))**(1/(1-alpha))
     A = A0
     annual, sectors = [], []
-
     for year in range(2026, 2032):
-        apply_shock = scenario is not None and (
-            year == shock_year or (recurring and year >= shock_year)
-        )
+        apply_shock = bool(np.any(transfer)) and (
+            year == shock_year or (recurring and year >= shock_year))
         target_shares = changed if apply_shock else original
-        target_cap = cap0 * K / initial_capital_stock
+        target_cap = dict(zip(goods, cap0 * K / K0))
         target_lab = lab0 * L / initial_labour
         target_tech = A / A0
-
-        # The unshocked 2026 benchmark has already been solved.
+        # The calibrated 2026 solution also satisfies the new sector capital
+        # equations by construction. No independent shocked model is created.
         if year != 2026 or apply_shock:
             try:
                 solve_gradually(model, solver, target_cap, target_lab,
                                 target_tech, target_shares)
             except Exception as exc:
-                raise RuntimeError(
-                    f"CGE failed in {year}, shock={apply_shock}, "
-                    f"K={K:.6g}, L={L:.6g}, technology={target_tech:.6g}: {exc}"
-                ) from exc
-
-        # Check the omitted market equation as well as active equations.
+                raise RuntimeError(f"CGE failed in {year}, shock={apply_shock}, "
+                    f"K={K.sum():.6g}, L={L:.6g}: {exc}") from exc
+        # Keep the existing market-residual check, including the omitted good.
         for con in list(model.component_data_objects(pyo.Constraint, active=True)) + [model.eqpqd[goods[0]]]:
             body = pyo.value(con.body)
             for bound, sign in [(con.lower, -1), (con.upper, 1)]:
@@ -383,37 +458,49 @@ def project_cge(
                     rhs = pyo.value(bound)
                     if not np.isfinite(body) or sign*(body-rhs) > 1e-3 + 1e-6 * max(1, abs(rhs), abs(body)):
                         raise RuntimeError(f"Market/constraint residual in {year}: {con.name}: {body-rhs}")
-        investment = investment_scale * real_investment(model)
-        # Include productivity in constant-price value added via Y quantities.
-        real_gva = sum(pyo.value(base.py[i]) * pyo.value(model.Y[i])
-                       for i in goods)
+        commodity_investment = investment_scale * np.array([
+            prices[i] * pyo.value(model.Xv[i]) for i in goods])
+        investment = float(commodity_investment.sum())
+        # The same investment pool is allocated to productive destinations.
+        # No £15m is added to aggregate capital: the transfer sums to zero.
+        policy_pounds = transfer * investment_scale if apply_shock else np.zeros(len(goods))
+        installed = installed_investment(investment, weights, policy_pounds)
+        K_next = (1 - depreciation) * K + installed
+        if (K_next <= 0).any() or not np.isfinite(K_next).all():
+            raise ValueError(f"Invalid next-year sectoral capital stocks in {year}")
+        if not np.isclose(K_next.sum(), (1-depreciation)*K.sum()+investment, rtol=1e-12, atol=0.01):
+            raise RuntimeError("Aggregate capital accounting error.")
+        real_gva = sum(pyo.value(base.py[i]) * pyo.value(model.Y[i]) for i in goods)
         annual.append({
             "Year": year,
-            "Capital stock (£)": K,
+            "Capital stock (£)": K.sum(),
             "Labour stock": L,
             "Technology": A,
-            "Solow-Swan output (£)": K**alpha * (A*L)**(1-alpha),
+            "Solow-Swan output (£)": K.sum()**alpha * (A*L)**(1-alpha),
             "CGE real GVA (model units)": real_gva,
             "CGE investment demand (£)": investment,
+            "Installed investment (£)": installed.sum(),
             "Labour supply (model units)": pyo.value(model.LS),
         })
         jobs = jobs_change(base, model, goods)
-        for i in goods:
+        for j, i in enumerate(goods):
+            income = pyo.value(model.capital_rent[i]*model.F["CAP", i])
             sectors.append({
                 "Year": year, "Sector": i,
                 "Output": pyo.value(model.Z[i]),
                 "Labour (model units)": pyo.value(model.F["LAB", i]),
                 "Estimated jobs": jobs.loc[i, "Jobs after"],
-                "Capital income": pyo.value(model.pf["CAP"] * model.F["CAP", i]),
-                "Real capital income": pyo.value(model.pf["CAP"] * model.F["CAP", i]
-                                                 / model.consumer_price_index),
+                "Capital stock (£)": K[j],
+                "Commodity investment (£)": commodity_investment[j],
+                "Installed investment (£)": installed[j],
+                "Policy capital transfer (£)": policy_pounds[j],
+                "Capital rental price": pyo.value(model.capital_rent[i]),
+                "Capital income": income,
+                "Real capital income": income / pyo.value(model.consumer_price_index),
             })
-
-        # Annual discrete Solow-Swan update using realised CGE investment.
-        K = (1 - depreciation) * K + investment
+        K = K_next
         L *= exp(n)
         A *= exp(g)
-
     annual_frame = pd.DataFrame(annual).set_index("Year")
     sector_frame = pd.DataFrame(sectors).set_index(["Year", "Sector"])
     if not annual_frame.index.is_unique or not sector_frame.index.is_unique:
@@ -472,10 +559,10 @@ def baseline_diagnostics(base_annual, base_sectors):
     print("\nBaseline employment changes by sector:")
     print(sector_results[["Jobs in 2026", "Jobs in 2031", "Jobs change",
                           "Jobs growth (%)", "Jobs per labour unit"]].round(3).to_string())
-    comparison.to_csv("baseline_employment_diagnostic.csv")
-    sector_results.to_csv("baseline_sector_diagnostic.csv")
-    conversion_results.to_csv("labour_conversion_diagnostic.csv")
-    base_sectors.to_csv("baseline_sector_annual.csv")
+    comparison.to_csv("v6_baseline_employment_diagnostic.csv")
+    sector_results.to_csv("v6_baseline_sector_diagnostic.csv")
+    conversion_results.to_csv("v6_labour_conversion_diagnostic.csv")
+    base_sectors.to_csv("v6_baseline_sector_annual.csv")
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(comparison.index, comparison["Jobs growth (%)"], marker="o", label="Estimated jobs")
@@ -487,7 +574,7 @@ def baseline_diagnostics(base_annual, base_sectors):
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig("baseline_employment_growth.png", dpi=200)
+    fig.savefig("v6_baseline_employment_growth.png", dpi=200)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -499,7 +586,7 @@ def baseline_diagnostics(base_annual, base_sectors):
            title="Baseline sectoral employment change: 2026–2031")
     ax.grid(axis="x", alpha=0.3)
     fig.tight_layout()
-    fig.savefig("baseline_sector_employment.png", dpi=200)
+    fig.savefig("v6_baseline_sector_employment.png", dpi=200)
     plt.close(fig)
     print("Baseline diagnostics and figures saved.", flush=True)
     return comparison, sector_results
@@ -630,9 +717,11 @@ def run_one_allocation(amount, mode, epsilon_L, base_sectors, recipients, recurr
         return merged
 
     worker_check = compare(_worker_baseline, base_sectors, "Worker baseline")
-    if not np.allclose(worker_check["Estimated jobs_scenario"],
-                       worker_check["Estimated jobs_base"], atol=0.05, rtol=0):
-        raise RuntimeError("Worker baseline differs from parent baseline.")
+    for column, atol in [("Estimated jobs", 0.05), ("Real capital income", 1e-4),
+                         ("Capital stock (£)", 10.0)]:
+        if not np.allclose(worker_check[f"{column}_scenario"], worker_check[f"{column}_base"],
+                           atol=atol, rtol=1e-8):
+            raise RuntimeError(f"Worker baseline differs from parent baseline: {column}")
     solver = make_solver()
     shocked_annual, shocked_sectors = project_cge(
         scenario_base, goods, solver, scenario=scenario,
@@ -658,6 +747,11 @@ def run_one_allocation(amount, mode, epsilon_L, base_sectors, recipients, recurr
             "Cumulative job-years 2027-2031": net_jobs_by_year.loc[2027:2031].sum(),
             "Net jobs in 2031": net_jobs_by_year.loc[2031],
             "Peak jobs 2027-2031": net_jobs_by_year.loc[2027:2031].max(),
+            **{f"{i} capital stock change in 2031 (£)": float(
+                comparison.loc[comparison["Year"].eq(2031) & comparison["Sector"].eq(i),
+                               "Capital stock (£)_scenario"].iloc[0]
+                - comparison.loc[comparison["Year"].eq(2031) & comparison["Sector"].eq(i),
+                                 "Capital stock (£)_base"].iloc[0]) for i in recipients},
             **{f"Net jobs in {year}": net_jobs_by_year.loc[year]
                for year in range(2027, 2031)},
         },
@@ -679,9 +773,9 @@ def main():
 
     recurring = False  # True: maintain the changed investment shares from 2027
     diagnostics_only = False  # True: produce baseline diagnostics and stop.
-    max_evaluations = 500  # Total attempts, including saved results.
+    max_evaluations = 500  # Test first; increase after checking the new baseline.
     candidate_count = 20000
-    worker_limit = 4  # Benchmark 4 versus 8 on your machine.
+    worker_limit = 4  # Test first; increase to 4 after validation.
     budget = 15.0
     recipients = ["MATL", "ENG", "C27", "TRAN", "INFO", "FIN", "M72"]
     missing = set(recipients) - set(goods)
@@ -712,24 +806,13 @@ def main():
         return
 
     # Separate checkpoint because the employment objective has changed.
-    checkpoint = Path("bayesian_v4_investment_results.csv")
-    # BEGIN CHECKPOINT COMPATIBILITY
-    # Preserve V4 signatures: GP settings affect proposal selection only,
-    # not the CGE equations or the values of either objective.
+    checkpoint = Path("bayesian_v6_investment_results.csv")
+    # The sectoral closure changes the model, so old scores are incompatible.
     source = Path(__file__).read_text(encoding="utf-8")
-    source = re.sub(
-        r"(?ms)^    # BEGIN CHECKPOINT COMPATIBILITY\n.*?^    # END CHECKPOINT COMPATIBILITY\n",
-        lambda _: '    signature = hashlib.sha256(\n        (sam.to_csv() + repr((mode, epsilon_L, recurring, budget, recipients))\n         + re.sub(r"(?m)^    (max_evaluations|worker_limit|candidate_count|max_runtime_hours|diagnostics_only) = .*$", "", Path(__file__).read_text(encoding="utf-8"))).encode()\n    ).hexdigest()\n', source, count=1
-    )
-    source = re.sub(
-        r"(?ms)^            # BEGIN GP SEARCH SETTINGS\n.*?^            # END GP SEARCH SETTINGS\n",
-        lambda _: '            gp = GaussianProcessRegressor(kernel=ConstantKernel(1.0)*Matern(length_scale=0.4, nu=2.5),\n                                          alpha=1e-6, normalize_y=False, random_state=42)\n', source, count=1
-    )
     signature = hashlib.sha256(
         (sam.to_csv() + repr((mode, epsilon_L, recurring, budget, recipients))
          + re.sub(r"(?m)^    (max_evaluations|worker_limit|candidate_count|max_runtime_hours|diagnostics_only) = .*$", "", source)).encode()
     ).hexdigest()
-    # END CHECKPOINT COMPATIBILITY
     rows = []
     if checkpoint.exists():
         saved = pd.read_csv(checkpoint)
@@ -745,10 +828,10 @@ def main():
         frame.sort_values("Scenario").to_csv(tmp, index=False)
         os.replace(tmp, checkpoint)
         good = frame[frame["Status"] == "Success"]
-        for score, filename in [("Cumulative job-years 2027-2031", "bayesian_v4_jobs_rankings.csv"),
-                                ("Capital income change in 2031", "bayesian_v4_capital_rankings.csv")]:
+        for score, filename in [("Cumulative job-years 2027-2031", "bayesian_v6_jobs_rankings.csv"),
+                                ("Capital income change in 2031", "bayesian_v6_capital_rankings.csv")]:
             good.sort_values(score, ascending=False).to_csv(filename, index=False)
-        frame[frame["Status"] == "Failed"].to_csv("bayesian_v4_failed_scenarios.csv", index=False)
+        frame[frame["Status"] == "Failed"].to_csv("bayesian_v6_failed_scenarios.csv", index=False)
 
     rng = np.random.default_rng(42 + len(rows))
     d = len(recipients)
@@ -831,7 +914,9 @@ def main():
         _, control = project_cge(base, goods, make_solver(), scenario={i: 0.0 for i in goods})
         error = (control["Estimated jobs"] - base_sectors["Estimated jobs"]).abs().max()
         print(f"Zero-shock maximum sector/year error: {error:.6g} jobs")
-        if not np.isfinite(error) or error > 0.05:
+        if (not np.isfinite(error) or error > 0.05
+                or not np.allclose(control["Capital stock (£)"], base_sectors["Capital stock (£)"], atol=10.0, rtol=1e-8)
+                or not np.allclose(control["Real capital income"], base_sectors["Real capital income"], atol=1e-4, rtol=1e-8)):
             raise RuntimeError("Zero-shock validation failed; optimisation stopped.")
         max_workers = min(worker_limit, os.cpu_count() or 1)
         with ProcessPoolExecutor(max_workers=max_workers,
@@ -882,6 +967,25 @@ def main():
             best = max(results,key=lambda r:r[score])
             print(f"Best tested {score}: {best[score]}")
             print({i:best["Allocation"][i] for i in recipients})
+        # Reproduce the two reported best allocations and export their paths.
+        # If an old checkpoint is already complete, recreate the common base.
+        base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
+        _, benchmark_sectors = project_cge(base, goods, make_solver())
+        for objective, tag in zip(scores, ("jobs", "capital")):
+            best = max(results, key=lambda r:r[objective])
+            try:
+                annual, sectors = project_cge(base, goods, make_solver(),
+                    scenario=best["Allocation"], shock_year=2027, recurring=recurring)
+                annual.to_csv(f"v6_best_{tag}_annual.csv")
+                sectors.to_csv(f"v6_best_{tag}_sectors.csv")
+                delta_jobs = (sectors["Estimated jobs"] - benchmark_sectors["Estimated jobs"]).groupby(level="Year").sum()
+                delta_capital = (sectors["Real capital income"] - benchmark_sectors["Real capital income"]).xs(2031, level="Year").sum()
+                rechecked = delta_jobs.loc[2027:2031].sum() if tag == "jobs" else delta_capital
+                print(f"Best {tag} objective recheck: {rechecked:.8g} (saved {best[objective]:.8g})")
+                if not np.isclose(rechecked, best[objective], rtol=1e-6, atol=0.05 if tag == "jobs" else 1e-4):
+                    print(f"WARNING: best {tag} result was not reproduced; investigate before using it.")
+            except Exception as exc:
+                print(f"Best {tag} trajectory recheck failed: {exc}", flush=True)
         plot_jobs(results)
         plot_money(results)
 
