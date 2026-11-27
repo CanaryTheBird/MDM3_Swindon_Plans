@@ -17,9 +17,6 @@ import time
 import hashlib
 import re
 from pathlib import Path
-from scipy.special import ndtr
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern, ConstantKernel
 import pandas as pd
 import pyomo.environ as pyo
 from pycge.examples.stdcge_model_def import StdModelDef
@@ -28,7 +25,10 @@ from Create_SAM_folder import sam_to_std
 from math import exp
 import numpy as np
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures.process import BrokenProcessPool
+from math import comb
+import csv
 
 from scipy.integrate import solve_ivp #zach code
 
@@ -762,232 +762,223 @@ def run_one_allocation(amount, mode, epsilon_L, base_sectors, recipients, recurr
     )
 
 
-def main():
-    start_time = time.monotonic()
-    max_runtime_hours = 8
-    deadline = start_time + max_runtime_hours * 3600
-    mode = "reallocate"  # Reallocation only in this version.
-    epsilon_L = 0.6
 
-    sam, goods, netted, data = sam_to_std()
+# Exhaustive search settings. Runtime settings can change between sessions.
+BUDGET = 15
+INCREMENT = 1   # £m; integer increments that divide BUDGET
+WORKERS = 16
+MAX_RUNTIME_HOURS = 40  # Per session; None means no time limit.
+MAX_ATTEMPTS_PER_SESSION = None  # Set to 12 for a short smoke test.
+RANKINGS_EVERY = 250
+RECURRING = False
+EPSILON_L = 0.6
+RECIPIENTS = ["MATL", "ENG", "C27", "TRAN", "INFO", "FIN", "M72"]
+JOBS = "Cumulative job-years 2027-2031"
+CAPITAL = "Capital income change in 2031"
 
-    recurring = False  # True: maintain the changed investment shares from 2027
-    diagnostics_only = False  # True: produce baseline diagnostics and stop.
-    max_evaluations = 500  # Test first; increase after checking the new baseline.
-    candidate_count = 20000
-    worker_limit = 4  # Test first; increase to 4 after validation.
-    budget = 15.0
-    recipients = ["MATL", "ENG", "C27", "TRAN", "INFO", "FIN", "M72"]
-    missing = set(recipients) - set(goods)
-    if missing:
-        raise ValueError(f"Missing recipient sectors: {missing}")
-    donors = [sector for sector in goods if sector not in recipients]
 
-    # Fund the reallocation proportionally to benchmark investment.
-    donor_changes = {}
-    if mode == "reallocate":
-        donor_investment = sam.loc[donors, "INV"].astype(float)
-        if (donor_investment < 0).any():
-            raise ValueError("Negative benchmark donor investment; check SAM.")
-        donor_total = donor_investment.sum()
-        if donor_total < budget or donor_total <= 0:
-            raise ValueError("Insufficient benchmark donor investment.")
-        donor_changes = (-budget * donor_investment / donor_total).to_dict()
-
-    def allocation_from_weights(weights):
-        return {**dict(zip(recipients, budget * np.asarray(weights))),
-                **donor_changes}
-
-    if diagnostics_only:
-        print("Solving baseline model for diagnostics...")
-        base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
-        base_annual, base_sectors = project_cge(base, goods, make_solver())
-        baseline_diagnostics(base_annual, base_sectors)
+def integer_allocations(total, dimensions):
+    """Generate each weak composition exactly once, using integer arithmetic."""
+    if dimensions == 1:
+        yield (total,)
         return
+    for first in range(total, -1, -1):
+        for tail in integer_allocations(total - first, dimensions - 1):
+            yield (first,) + tail
 
-    # Separate checkpoint because the employment objective has changed.
-    checkpoint = Path("bayesian_v6_investment_results.csv")
-    # The sectoral closure changes the model, so old scores are incompatible.
+
+def make_grid(budget, increment, dimensions):
+    if not isinstance(budget, int) or not isinstance(increment, int) or increment <= 0 or budget <= 0 or budget % increment:
+        raise ValueError("Use positive integer £m increments that divide the budget.")
+    # Test pure allocations first, then pairs, then increasingly mixed ones.
+    grid = list(integer_allocations(budget // increment, dimensions))
+    grid.sort(key=lambda a: (sum(v > 0 for v in a), tuple(-v for v in a)))
+    return [tuple(v * increment for v in a) for a in grid]
+
+
+def grid_worker_init(mode, epsilon_L, base_sectors, recipients, recurring):
+    global _grid_worker_args
+    initialise_worker(mode, epsilon_L)
+    _grid_worker_args = (mode, epsilon_L, base_sectors, recipients, recurring)
+
+
+def grid_worker(amount):
+    return run_one_allocation(amount, *_grid_worker_args)
+
+
+def atomic_csv(frame, path):
+    tmp = path.with_suffix(".tmp")
+    frame.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def main():
+    start = time.monotonic()
+    deadline = float("inf") if MAX_RUNTIME_HOURS is None else start + MAX_RUNTIME_HOURS * 3600
+    mode = "reallocate"
+    recipients = RECIPIENTS.copy()
+    sam, goods, _, _ = sam_to_std()
+    goods = list(goods)
+    if set(recipients) - set(goods):
+        raise ValueError("Some recipient sectors are missing from the SAM.")
+    donors = [s for s in goods if s not in recipients]
+    donor_inv = sam.loc[donors, "INV"].astype(float)
+    if (donor_inv < 0).any() or donor_inv.sum() < BUDGET:
+        raise ValueError("Insufficient nonnegative benchmark donor investment.")
+    donor_changes = (-BUDGET * donor_inv / donor_inv.sum()).to_dict()
+
+    grid = make_grid(BUDGET, INCREMENT, len(recipients))
+    total = len(grid)
+    assert total == comb(BUDGET // INCREMENT + len(recipients) - 1, len(recipients) - 1)
+    print(f"Exhaustive grid: {total:,} unique allocations", flush=True)
+    prefix = f"grid_v6_{INCREMENT}m"
+    checkpoint = Path(f"{prefix}_investment_results.csv")
+    # Hash economic functions + SAM + grid definition and policy settings.
+    # Runtime limits and worker count may be changed without invalidating results.
     source = Path(__file__).read_text(encoding="utf-8")
-    signature = hashlib.sha256(
-        (sam.to_csv() + repr((mode, epsilon_L, recurring, budget, recipients))
-         + re.sub(r"(?m)^    (max_evaluations|worker_limit|candidate_count|max_runtime_hours|diagnostics_only) = .*$", "", source)).encode()
-    ).hexdigest()
+    model_source = source.split("# Exhaustive search settings.", 1)[0]
+    signature = hashlib.sha256((model_source + sam.to_csv() + repr((
+        BUDGET, INCREMENT, recipients, mode, EPSILON_L, RECURRING, "grid_order_v1"
+    ))).encode()).hexdigest()
+    columns = ["Scenario", "Run signature", *goods, JOBS, CAPITAL,
+               "Net jobs in 2031", "Peak jobs 2027-2031",
+               *[f"{i} capital stock change in 2031 (£)" for i in recipients],
+               *[f"Net jobs in {y}" for y in range(2027, 2031)], "Status", "Error"]
     rows = []
+    completed = set()
     if checkpoint.exists():
         saved = pd.read_csv(checkpoint)
-        if "Run signature" not in saved or not saved["Run signature"].eq(signature).all():
-            raise ValueError("Checkpoint settings/code differ. Rename the old CSV.")
-        saved["Run signature"] = signature
-        rows = saved.to_dict("records")
-        print(f"Resuming with {len(rows)} previous attempts.")
+        if list(saved.columns) != columns or not saved["Run signature"].eq(signature).all():
+            raise ValueError("Checkpoint is incompatible with this model/grid. Do not mix runs.")
+        if saved["Scenario"].duplicated().any():
+            raise ValueError("Duplicate IDs in checkpoint; inspect before continuing.")
+        for row in saved.to_dict("records"):
+            idx = int(row["Scenario"])
+            if idx != row["Scenario"] or not 1 <= idx <= total or row["Status"] not in ("Success", "Failed"):
+                raise ValueError(f"Invalid checkpoint row: {idx}")
+            if not np.allclose([row[s] for s in recipients], grid[idx-1], rtol=0, atol=1e-9):
+                raise ValueError(f"Checkpoint allocation mismatch: {idx}")
+            if not np.allclose([row[s] for s in donors], [donor_changes[s] for s in donors], rtol=0, atol=1e-9):
+                raise ValueError(f"Checkpoint donor mismatch: {idx}")
+            if row["Status"] == "Success" and not np.isfinite([row[c] for c in columns if c not in ("Scenario", "Run signature", "Status", "Error")]).all():
+                raise ValueError(f"Incomplete successful checkpoint row: {idx}")
+            completed.add(idx)
+            rows.append(row)
+        print(f"Resuming: {len(completed):,}/{total:,} already attempted.", flush=True)
+    else:
+        with checkpoint.open("x", encoding="utf-8", newline="") as f:
+            csv.DictWriter(f, fieldnames=columns).writeheader()
+            f.flush()
+            os.fsync(f.fileno())
 
-    def save_results():
-        frame = pd.DataFrame(rows)
-        tmp = checkpoint.with_suffix(".tmp")
-        frame.sort_values("Scenario").to_csv(tmp, index=False)
-        os.replace(tmp, checkpoint)
-        good = frame[frame["Status"] == "Success"]
-        for score, filename in [("Cumulative job-years 2027-2031", "bayesian_v6_jobs_rankings.csv"),
-                                ("Capital income change in 2031", "bayesian_v6_capital_rankings.csv")]:
-            good.sort_values(score, ascending=False).to_csv(filename, index=False)
-        frame[frame["Status"] == "Failed"].to_csv("bayesian_v6_failed_scenarios.csv", index=False)
+    def export_rankings():
+        frame = pd.DataFrame(rows, columns=columns)
+        successful = frame.loc[frame["Status"].eq("Success")]
+        atomic_csv(successful.sort_values(JOBS, ascending=False), Path(f"{prefix}_jobs_rankings.csv"))
+        atomic_csv(successful.sort_values(CAPITAL, ascending=False), Path(f"{prefix}_capital_rankings.csv"))
+        atomic_csv(frame.loc[frame["Status"].eq("Failed")], Path(f"{prefix}_failed_scenarios.csv"))
+        # Exact non-dominated set among evaluated successful grid points.
+        ordered = successful.sort_values([JOBS, CAPITAL], ascending=False)
+        frontier = ordered.loc[ordered[CAPITAL] > ordered[CAPITAL].cummax().shift(fill_value=-np.inf)]
+        atomic_csv(frontier.sort_values(JOBS), Path(f"{prefix}_pareto_allocations.csv"))
+        if not successful.empty:
+            for objective in (JOBS, CAPITAL):
+                best = successful.loc[successful[objective].idxmax()]
+                print(f"Best tested {objective}: {best[objective]:.8g} | "
+                      f"{dict((s, float(best[s])) for s in recipients)}", flush=True)
+        print(f"Coverage: {len(frame):,}/{total:,} attempted; {len(successful):,} successful; "
+              f"{len(frame)-len(successful):,} failed.", flush=True)
 
-    rng = np.random.default_rng(42 + len(rows))
-    d = len(recipients)
-    initial = np.vstack([np.eye(d), np.full((1,d), 1/d),
-                         np.random.default_rng(42).dirichlet(np.ones(d), size=4)])
-    scores = ["Cumulative job-years 2027-2031", "Capital income change in 2031"]
-
-    def propose(count):
-        attempted = [np.array([r[i] for i in recipients], float)/budget for r in rows]
-        chosen = []
-        def unseen(w):
-            return all(np.linalg.norm(w-v) > 1e-6 for v in attempted + chosen)
-        for w in initial:
-            if len(chosen) == count:
-                return chosen
-            if unseen(w):
-                chosen.append(w)
-        good = [r for r in rows if r["Status"] == "Success" and
-                all(np.isfinite(float(r[k])) for k in scores)]
-        if len(good) < 5:
-            while len(chosen) < count:
-                w = rng.dirichlet(np.ones(d))
-                if unseen(w): chosen.append(w)
-            return chosen
-        X = np.array([[r[i]/budget for i in recipients] for r in good])
-        pool = np.vstack([rng.dirichlet(np.full(d,a), size=candidate_count//3)
-                          for a in (0.15, 1., 4.)])
-        # Include local perturbations around each objective's best observed point.
-        for score in scores:
-            best = X[np.argmax([r[score] for r in good])]
-            pool = np.vstack([pool, rng.dirichlet(0.1 + 30*best, size=1000)])
-        acquisition = []
-        for score in scores:
-            y = np.array([r[score] for r in good], float)
-            scale = max(np.std(y), 1e-10)
-            y = (y-y.mean())/scale
-            # BEGIN GP SEARCH SETTINGS
-            gp = GaussianProcessRegressor(
-                kernel=ConstantKernel(
-                    constant_value=1.0,
-                    constant_value_bounds=(1e-3, 1e3)
-                ) * Matern(
-                    length_scale=0.4,
-                    length_scale_bounds=(0.01, 5.0),
-                    nu=2.5
-                ),
-                alpha=1e-4,
-                normalize_y=False,
-                n_restarts_optimizer=2,
-                random_state=42
-            )
-            # END GP SEARCH SETTINGS
-            gp.fit(X,y)
-            mu, sd = gp.predict(pool, return_std=True)
-            improvement = mu-y.max()-0.01
-            z = improvement/np.maximum(sd,1e-12)
-            ei = improvement*ndtr(z)+sd*np.exp(-0.5*z*z)/np.sqrt(2*np.pi)
-            acquisition.append(ei)
-        while len(chosen) < count:
-            # Alternate objectives; discourage near-duplicate parallel proposals.
-            ei = acquisition[(len(rows)+len(chosen))%2].copy()
-            for v in attempted + chosen:
-                dist = np.linalg.norm(pool-v,axis=1)
-                ei *= np.minimum(1.,dist/0.12)
-                ei[dist<=1e-6] = -np.inf
-            idx = int(np.argmax(ei))
-            if not np.isfinite(ei[idx]):
-                w = rng.dirichlet(np.ones(d))
-                if unseen(w): chosen.append(w)
-            else:
-                chosen.append(pool[idx])
-        return chosen
-
-    if len(rows) < max_evaluations and time.monotonic() < deadline:
-        print("Solving baseline model...")
-        base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
-        base_annual, base_sectors = project_cge(base, goods, make_solver())
-        baseline_diagnostics(base_annual, base_sectors)
-        # Zero-shock validation before expensive optimisation.
-        _, control = project_cge(base, goods, make_solver(), scenario={i: 0.0 for i in goods})
-        error = (control["Estimated jobs"] - base_sectors["Estimated jobs"]).abs().max()
-        print(f"Zero-shock maximum sector/year error: {error:.6g} jobs")
-        if (not np.isfinite(error) or error > 0.05
-                or not np.allclose(control["Capital stock (£)"], base_sectors["Capital stock (£)"], atol=10.0, rtol=1e-8)
-                or not np.allclose(control["Real capital income"], base_sectors["Real capital income"], atol=1e-4, rtol=1e-8)):
-            raise RuntimeError("Zero-shock validation failed; optimisation stopped.")
-        max_workers = min(worker_limit, os.cpu_count() or 1)
-        with ProcessPoolExecutor(max_workers=max_workers,
-                                 initializer=initialise_worker,
-                                 initargs=(mode, epsilon_L)) as executor:
-            while len(rows) < max_evaluations and time.monotonic() < deadline:
-                weights = propose(min(max_workers, max_evaluations-len(rows)))
-                if time.monotonic() >= deadline:
-                    break
-                first = max([int(r["Scenario"]) for r in rows], default=0)+1
-                futures = {}
-                for idx,w in enumerate(weights, first):
-                    if time.monotonic() >= deadline:
-                        break
-                    amount = allocation_from_weights(w)
-                    future = executor.submit(run_one_allocation, amount, mode,
-                                             epsilon_L, base_sectors, recipients, recurring)
-                    futures[future] = (idx,amount)
-                for future in as_completed(futures):
-                    idx,amount = futures[future]
-                    row = {"Scenario":idx, "Run signature":signature,
-                           **{i:amount.get(i,0.) for i in goods}}
-                    try:
-                        jobs,capital = future.result()
-                        row.update({scores[0]:jobs[scores[0]], scores[1]:capital[scores[1]]})
-                        row.update({k: v for k, v in jobs.items() if k != "Allocation"})
-                        if not all(np.isfinite(row[k]) for k in scores):
-                            raise ValueError("Nonfinite objective")
-                        row.update(Status="Success", Error="")
-                    except Exception as exc:
-                        print(f"Scenario {idx} error: {type(exc).__name__}: {exc}", flush=True)
-                        row.update({scores[0]:np.nan,scores[1]:np.nan,
-                                    "Status":"Failed","Error":str(exc)})
-                    rows.append(row)
-                    save_results()
-                    elapsed = (time.monotonic() - start_time) / 3600
-                    print(f"Scenario {idx}: {row['Status']} ({len(rows)}/{max_evaluations}) | {elapsed:.2f}h elapsed", flush=True)
-    if time.monotonic() >= deadline:
-        print("Time limit reached. No further scenarios will be submitted.")
-    if not rows:
+    remaining = ((idx, a) for idx, a in enumerate(grid, 1) if idx not in completed)
+    if len(completed) == total:
+        export_rankings()
+        print("All grid allocations have been attempted. Check failed scenarios before claiming an exhaustive optimum.")
         return
-    save_results()
-    good = [r for r in rows if r["Status"] == "Success"]
-    if good:
-        results = [{"Allocation":{i:r[i] for i in goods},
-                    **{k:r[k] for k in scores}} for r in good]
-        for score in scores:
-            best = max(results,key=lambda r:r[score])
-            print(f"Best tested {score}: {best[score]}")
-            print({i:best["Allocation"][i] for i in recipients})
-        # Reproduce the two reported best allocations and export their paths.
-        # If an old checkpoint is already complete, recreate the common base.
-        base, _, _, goods, _, _ = base_model(mode, {}, epsilon_L)
-        _, benchmark_sectors = project_cge(base, goods, make_solver())
-        for objective, tag in zip(scores, ("jobs", "capital")):
-            best = max(results, key=lambda r:r[objective])
-            try:
-                annual, sectors = project_cge(base, goods, make_solver(),
-                    scenario=best["Allocation"], shock_year=2027, recurring=recurring)
-                annual.to_csv(f"v6_best_{tag}_annual.csv")
-                sectors.to_csv(f"v6_best_{tag}_sectors.csv")
-                delta_jobs = (sectors["Estimated jobs"] - benchmark_sectors["Estimated jobs"]).groupby(level="Year").sum()
-                delta_capital = (sectors["Real capital income"] - benchmark_sectors["Real capital income"]).xs(2031, level="Year").sum()
-                rechecked = delta_jobs.loc[2027:2031].sum() if tag == "jobs" else delta_capital
-                print(f"Best {tag} objective recheck: {rechecked:.8g} (saved {best[objective]:.8g})")
-                if not np.isclose(rechecked, best[objective], rtol=1e-6, atol=0.05 if tag == "jobs" else 1e-4):
-                    print(f"WARNING: best {tag} result was not reproduced; investigate before using it.")
-            except Exception as exc:
-                print(f"Best {tag} trajectory recheck failed: {exc}", flush=True)
-        plot_jobs(results)
-        plot_money(results)
+
+    # Same parent calibration and zero-shock validation as V6.
+    print("Solving baseline model...", flush=True)
+    base, _, _, goods, _, _ = base_model(mode, {}, EPSILON_L)
+    base_annual, base_sectors = project_cge(base, goods, make_solver())
+    # Do not overwrite the original V6 Bayesian baseline files.
+    base_annual.to_csv(f"{prefix}_baseline_annual.csv")
+    base_sectors.to_csv(f"{prefix}_baseline_sectors.csv")
+    _, control = project_cge(base, goods, make_solver(), scenario={s: 0.0 for s in goods})
+    error = (control["Estimated jobs"] - base_sectors["Estimated jobs"]).abs().max()
+    print(f"Zero-shock maximum sector/year error: {error:.6g} jobs", flush=True)
+    if (not np.isfinite(error) or error > 0.05
+            or not np.allclose(control["Capital stock (£)"], base_sectors["Capital stock (£)"], atol=10.0, rtol=1e-8)
+            or not np.allclose(control["Real capital income"], base_sectors["Real capital income"], atol=1e-4, rtol=1e-8)):
+        raise RuntimeError("Zero-shock validation failed; grid search stopped.")
+
+    submitted = 0
+    session_done = 0
+    workers = max(1, min(WORKERS, os.cpu_count() or 1))
+    # Only keep a small number of tasks in flight. Stop submitting at deadline,
+    # but save all in-flight results before exiting normally.
+    try:
+        with checkpoint.open("a", encoding="utf-8", newline="") as f, ProcessPoolExecutor(
+                max_workers=workers, initializer=grid_worker_init,
+                initargs=(mode, EPSILON_L, base_sectors, recipients, RECURRING)) as executor:
+            writer = csv.DictWriter(f, fieldnames=columns)
+            pending = {}
+
+            def submit_next():
+                nonlocal submitted
+                if time.monotonic() >= deadline or (MAX_ATTEMPTS_PER_SESSION is not None and submitted >= MAX_ATTEMPTS_PER_SESSION):
+                    return False
+                item = next(remaining, None)
+                if item is None:
+                    return False
+                idx, allocation = item
+                amount = {**donor_changes, **dict(zip(recipients, allocation))}
+                future = executor.submit(grid_worker, amount)
+                pending[future] = (idx, amount)
+                submitted += 1
+                return True
+
+            for _ in range(workers):
+                if not submit_next():
+                    break
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx, amount = pending.pop(future)
+                    row = {"Scenario": idx, "Run signature": signature, **{s: amount.get(s, 0.0) for s in goods}}
+                    try:
+                        jobs, capital = future.result()
+                        row.update({k: v for k, v in jobs.items() if k != "Allocation"})
+                        row[CAPITAL] = capital[CAPITAL]
+                        if not np.isfinite([row[c] for c in columns if c not in ("Scenario", "Run signature", "Status", "Error")]).all():
+                            raise ValueError("Nonfinite scenario results")
+                        row.update(Status="Success", Error="")
+                    except BrokenProcessPool:
+                        # Infrastructure failure is not an economic failure.
+                        # Do not mark these allocations as attempted; resume later.
+                        raise
+                    except Exception as exc:
+                        row.update(Status="Failed", Error=f"{type(exc).__name__}: {exc}".replace("\n", " ").replace("\r", " "))
+                    writer.writerow(row)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    rows.append(row)
+                    completed.add(idx)
+                    session_done += 1
+                    elapsed = time.monotonic() - start
+                    print(f"Scenario {idx}: {row['Status']} | {len(completed):,}/{total:,} | "
+                          f"{elapsed/3600:.2f}h elapsed", flush=True)
+                    if row["Status"] == "Failed":
+                        print(row["Error"], flush=True)
+                    if session_done % RANKINGS_EVERY == 0:
+                        export_rankings()
+                    submit_next()
+    except KeyboardInterrupt:
+        print("Interrupted. Already saved rows will be skipped on the next run.", flush=True)
+    finally:
+        export_rankings()
+    if len(completed) < total:
+        print("Grid incomplete. Run this same file again to resume from its CSV.")
+    else:
+        print("All grid allocations attempted. Any failures must be resolved to claim full successful coverage.")
 
 
 if __name__ == "__main__":

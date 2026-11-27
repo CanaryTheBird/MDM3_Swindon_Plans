@@ -1,0 +1,15 @@
+,Value
+Attempted,54264
+Successful plotted,54264
+Omitted,0
+Expected grid allocations,54264
+Unique attempted allocations,54264
+Complete successful grid,True
+Pearson,-0.6334975463597662
+Spearman,-0.5912557203687403
+Both positive,1
+"Jobs positive, capital negative",7397
+"Jobs negative, capital positive",3052
+Both negative,43814
+At least one zero,0
+Pareto outcomes,31
